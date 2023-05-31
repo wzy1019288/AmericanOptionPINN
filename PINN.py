@@ -512,8 +512,6 @@ fb_losses, total_losses) = [], [], [], [], [], [], [], [], []
 since = time.time()
 for epoch in tqdm(range(config.epochs), desc='PINNs - Training'):
     
-    # print('Epoch {}/{}'.format(epoch, params['epochs']-1), 'with LR = {:.1e}'.format(sol_optimizer.param_groups[0]['lr']))  
-
     # Case 1: more mdl steps for a single fb step
     for _ in range(config.steps_fb_per_pde - 1):
         train_sol_model()
@@ -527,7 +525,8 @@ for epoch in tqdm(range(config.epochs), desc='PINNs - Training'):
     # save current and best models to checkpoint
     is_best = total_l < early_warning['Target']
     helper.save_checkpoint({'epoch': epoch+1,
-                            'state_dict': sol_model.state_dict(),
+                            'sol_state_dict': sol_model.state_dict(),
+                            'fb_state_dict': fb_model.state_dict(),
                             'Unsupervised Loss': u_loss,
                             'Supervised Loss': sol_i_l + sol_d_l + sol_n_l,
                             'Free Boundary Loss': fb_l,
@@ -538,7 +537,8 @@ for epoch in tqdm(range(config.epochs), desc='PINNs - Training'):
                             'fb_init_loss': fb_i_l,
                             'fb_dir_loss': fb_d_l,
                             'fb_neu_loss': fb_n_l,
-                            'optimizer': sol_optimizer.state_dict(),
+                            'sol_optimizer': sol_optimizer.state_dict(),
+                            'fb_optimizer': fb_optimizer.state_dict(),
                            }, is_best, checkpoint=checkpoint_path)
     # save training process to log file
     logger.append([epoch+1, sol_optimizer.param_groups[0]['lr'], 

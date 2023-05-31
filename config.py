@@ -57,7 +57,7 @@ class OptionConfig:
     sup_weight = [1., 1., 1.]
     fb_weight = [1., 1., 1.]
     steps_fb_per_pde = 20
-    epochs = 1000
+    epochs = 10
     patience = 200
 
     def __post_init__(self):

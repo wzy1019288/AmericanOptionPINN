@@ -80,6 +80,7 @@ class SamplerDataset(Dataset):
         elif self.return_var == ['x']:
             return self.x[idx]
 
+
 # Define condition function
 def h_1(inp, K):
     res = list()
@@ -91,19 +92,22 @@ def h_2(inp):
     res = - np.ones( inp.shape[0] )
     return res
 
-def g(inp):
-    res = np.zeros( inp.shape[0] )
+def g(inp, K, r, T):
+    res = list()
+    for inp_val in inp:
+        res.append( np.max([0,
+                            K*np.exp(-r*(T-inp_val[-1]))-\
+                            np.min(inp_val[:-1])]) )
     return np.array(res)
 
 def u_0(inp, K):
     res = list()
     for inp_val in inp:
-        x, t = inp_val
-        res.append( np.max([0, K-x]) )
+        res.append( np.max([0, K - np.min(inp_val[:-1])]) )
     return np.array(res)
 
-def s_0(inp, K):
-    res = np.ones( inp.shape[0] ) * K
+def s_0(inp, K, n_dim):
+    res = np.ones( (inp.shape[0], n_dim) ) * K
     return np.array(res)
 
 
@@ -111,7 +115,7 @@ def get_train_dataloaders(n_dim, r, K, T, lb, ub, DTYPE, N_samples_trainset_pde,
 
     # PDE Conditions
     print('PDE Conditions\n')
-    # Interior x: 30000*1 t: 30000*1
+    # Interior x: 60000*n_dim t: 60000*1
     interior_sampler = Sampler_IBC(lb, ub, cond=None, DTYPE=DTYPE,
                         N_points=N_samples_trainset_pde, method='sobol', split=True)
     print('[interior_sampler]')
@@ -119,17 +123,29 @@ def get_train_dataloaders(n_dim, r, K, T, lb, ub, DTYPE, N_samples_trainset_pde,
     dataset_intrr = SamplerDataset(interior_sampler, 'x,t')
     dataloader_intrr = DataLoader(dataset_intrr, batch_size=len(dataset_intrr)//batch_num, shuffle=True, pin_memory=True)
 
-    # Initial  x: 300*2 y: 300
-    init_sampler = Sampler_IBC(np.array([0., T]), np.array([3.*K, T]),
-                            lambda inp: u_0(inp, K), N_samples_trainset_others, DTYPE=DTYPE, method='sobol' )
+    # Initial  x: 1500*(n_dim+1) y: 1500
+    init_sampler = Sampler_IBC(np.array( ([0.]*n_dim)+[T] ),
+                               np.array( ([3.*K]*n_dim)+[T] ),
+                               lambda inp: u_0(inp, K), N_samples_trainset_others, DTYPE=DTYPE, method='sobol' )
     print('[init_sampler]')
     print( f'x: {init_sampler.x.shape}     y: {init_sampler.y.shape}' )
     dataset_init = SamplerDataset(init_sampler, 'x,y')
     dataloader_init = DataLoader(dataset_init, batch_size=len(dataset_init)//batch_num, shuffle=True, pin_memory=True)
 
-    # Dirichlet  x: 300*2 y: 300
-    dir_sampler = Sampler_IBC(np.array([3.*K, 0.]), np.array([3.*K, T]),
-                            g, N_samples_trainset_others, DTYPE=DTYPE, method='sobol' )
+    # Dirichlet  x: 1500*(n_dim+1) y: 1500
+    # first  750 -- x: [Smax, S, t] 
+    # second 750 -- x: [S, Smax, t]
+    lb_dir = ([0.]*n_dim)+[0]; lb_dir[0] = 3.*K
+    dir_sampler = Sampler_IBC(np.array( lb_dir ),
+                              np.array( ([3.*K]*n_dim)+[T] ),
+                              lambda inp: g(inp, K, r, T), N_samples_trainset_others//n_dim, DTYPE=DTYPE, method='sobol' )
+    for dim in range(1, n_dim):
+        lb_dir = ([0.]*n_dim)+[0]; lb_dir[dim] = 3.*K
+        temp_sampler = Sampler_IBC(np.array( lb_dir ),
+                                np.array( ([3.*K]*n_dim)+[T] ),
+                                lambda inp: g(inp, K, r, T), N_samples_trainset_others//n_dim, DTYPE=DTYPE, method='sobol' )
+        dir_sampler.x = torch.cat([dir_sampler.x, temp_sampler.x], dim=0)
+        dir_sampler.y = torch.cat([dir_sampler.y, temp_sampler.y], dim=0)
     print('[dir_sampler]')
     print( f'x: {dir_sampler.x.shape}     y: {dir_sampler.y.shape}' )
     dataset_dir = SamplerDataset(dir_sampler, 'x,y')
@@ -141,15 +157,15 @@ def get_train_dataloaders(n_dim, r, K, T, lb, ub, DTYPE, N_samples_trainset_pde,
 
     # Free Boundary Conditions
     print('\nFree Boundary Conditions\n')
-    # Initial  x: 1*1 y: 1
+    # Initial  x: 1*1 y: 1*n_dim
     fb_init_sampler = Sampler_IBC(np.array([T]), np.array([T]),
-                                lambda inp: s_0(inp, K), 1, DTYPE=DTYPE )
+                                lambda inp: s_0(inp, K, n_dim), 1, DTYPE=DTYPE )
     print('[fb_init_sampler]')
     print( f'x: {fb_init_sampler.x.shape}     y: {fb_init_sampler.y.shape}' )
     dataset_fb_init = SamplerDataset(fb_init_sampler, 'x,y')
     dataloader_fb_init = DataLoader(dataset_fb_init, batch_size=len(dataset_fb_init), shuffle=True, pin_memory=True)
 
-    # Dirichlet  x: 300*1
+    # Dirichlet  x: 1500*1
     # Dirichlet condition is about B(t) which is changed with FNN_fb, so don't need calculate here
     fb_dir_sampler = Sampler_IBC(np.array([0.]), np.array([T]),
                                 None, N_samples_trainset_others, DTYPE=DTYPE, method='sobol' )
@@ -158,12 +174,13 @@ def get_train_dataloaders(n_dim, r, K, T, lb, ub, DTYPE, N_samples_trainset_pde,
     dataset_fb_dir = SamplerDataset(fb_dir_sampler, 'x')
     dataloader_fb_dir = DataLoader(dataset_fb_dir, batch_size=len(dataset_fb_dir)//batch_num, shuffle=True, pin_memory=True)
 
-    # Neumann  x: 300*1 y: 300
+    # Neumann  x: 1500*1
+    # Neumann condition is about B(t) which is changed with FNN_fb, so don't need calculate here
     fb_neu_sampler = Sampler_IBC(np.array([0.]), np.array([T]),
-                                h_2, N_samples_trainset_others, DTYPE=DTYPE, method='sobol' )
+                                None, N_samples_trainset_others, DTYPE=DTYPE, method='sobol' )
     print('[fb_neu_sampler]')
-    print( f'x: {fb_neu_sampler.x.shape}     y: {fb_neu_sampler.y.shape}' )
-    dataset_fb_neu = SamplerDataset(fb_neu_sampler, 'x,y')
+    print( f'x: {fb_neu_sampler.x.shape}' )
+    dataset_fb_neu = SamplerDataset(fb_neu_sampler, 'x')
     dataloader_fb_neu = DataLoader(dataset_fb_neu, batch_size=len(dataset_fb_neu)//batch_num, shuffle=True, pin_memory=True)
 
     # Conditions passed to PINN
@@ -177,73 +194,87 @@ def get_train_dataloaders(n_dim, r, K, T, lb, ub, DTYPE, N_samples_trainset_pde,
     
     return sol_conditions, fb_conditions
 
-
 def get_test_dataloaders(n_dim, r, K, T, lb, ub, DTYPE, N_samples_testset_pde, N_samples_testset_others):
+
     # PDE Conditions
     print('PDE Conditions\n')
-    # Interior x: 1000000*1 t: 1000000*1
+    # Interior x: 200000*n_dim t: 200000*1
     interior_sampler_test = Sampler_IBC(lb, ub, cond=None, DTYPE=DTYPE,
-                                N_points=N_samples_testset_pde, method='uniform', split=True)
-    print('[interior_sampler_test]')
+                        N_points=N_samples_testset_pde, method='uniform', split=True)
+    print('[interior_sampler]')
     print( f'x: {interior_sampler_test.x.shape}     t: {interior_sampler_test.t.shape}' )
     dataset_intrr_test = SamplerDataset(interior_sampler_test, 'x,t')
     dataloader_intrr_test = DataLoader(dataset_intrr_test, batch_size=len(dataset_intrr_test), shuffle=False, pin_memory=True)
 
-    # Initial  x: 1000*2 y: 1000
-    init_sampler_test = Sampler_IBC(np.array([0., T]), np.array([3.*K, T]),
-                            lambda inp: u_0(inp, K), N_samples_testset_others, DTYPE=DTYPE, method='uniform' )
-    print('[init_sampler_test]')
+    # Initial  x: 2000*(n_dim+1) y: 2000
+    init_sampler_test = Sampler_IBC(np.array( ([0.]*n_dim)+[T] ),
+                               np.array( ([3.*K]*n_dim)+[T] ),
+                               lambda inp: u_0(inp, K), N_samples_testset_others, DTYPE=DTYPE, method='uniform' )
+    print('[init_sampler]')
     print( f'x: {init_sampler_test.x.shape}     y: {init_sampler_test.y.shape}' )
     dataset_init_test = SamplerDataset(init_sampler_test, 'x,y')
     dataloader_init_test = DataLoader(dataset_init_test, batch_size=len(dataset_init_test), shuffle=False, pin_memory=True)
 
-    # Dirichlet  x: 1000*2 y: 1000
-    dir_sampler_test = Sampler_IBC(np.array([3.*K, 0.]), np.array([3.*K, T]),
-                            g, N_samples_testset_others, DTYPE=DTYPE, method='uniform' )
-    print('[dir_sampler_test]')
+    # Dirichlet  x: 2000*(n_dim+1) y: 2000
+    # first  1000 -- x: [Smax, S, t] 
+    # second 1000 -- x: [S, Smax, t]
+    lb_dir = ([0.]*n_dim)+[0]; lb_dir[0] = 3.*K
+    dir_sampler_test = Sampler_IBC(np.array( lb_dir ),
+                              np.array( ([3.*K]*n_dim)+[T] ),
+                              lambda inp: g(inp, K, r, T), N_samples_testset_others//n_dim, DTYPE=DTYPE, method='uniform' )
+    for dim in range(1, n_dim):
+        lb_dir = ([0.]*n_dim)+[0]; lb_dir[dim] = 3.*K
+        temp_sampler_test = Sampler_IBC(np.array( lb_dir ),
+                                np.array( ([3.*K]*n_dim)+[T] ),
+                                lambda inp: g(inp, K, r, T), N_samples_testset_others//n_dim, DTYPE=DTYPE, method='uniform' )
+        dir_sampler_test.x = torch.cat([dir_sampler_test.x, temp_sampler_test.x], dim=0)
+        dir_sampler_test.y = torch.cat([dir_sampler_test.y, temp_sampler_test.y], dim=0)
+    print('[dir_sampler]')
     print( f'x: {dir_sampler_test.x.shape}     y: {dir_sampler_test.y.shape}' )
     dataset_dir_test = SamplerDataset(dir_sampler_test, 'x,y')
     dataloader_dir_test = DataLoader(dataset_dir_test, batch_size=len(dataset_dir_test), shuffle=False, pin_memory=True)
 
     #Neumann
-    print('[neu_sampler_test]')
+    print('[neu_sampler]')
     print('No')
 
     # Free Boundary Conditions
     print('\nFree Boundary Conditions\n')
-    # Initial  t: 1*1 y: 1
+    # Initial  x: 1*1 y: 1*(n_dim+1)
     fb_init_sampler_test = Sampler_IBC(np.array([T]), np.array([T]),
-                                lambda inp: s_0(inp, K), 1, DTYPE=DTYPE )
-    print('[fb_init_sampler_test]')
-    print( f't: {fb_init_sampler_test.x.shape}     y: {fb_init_sampler_test.y.shape}' )
+                                lambda inp: s_0(inp, K, n_dim), 1, DTYPE=DTYPE )
+    print('[fb_init_sampler]')
+    print( f'x: {fb_init_sampler_test.x.shape}     y: {fb_init_sampler_test.y.shape}' )
     dataset_fb_init_test = SamplerDataset(fb_init_sampler_test, 'x,y')
     dataloader_fb_init_test = DataLoader(dataset_fb_init_test, batch_size=len(dataset_fb_init_test), shuffle=False, pin_memory=True)
 
-    # Dirichlet  t: 1000*1
+    # Dirichlet  x: 2000*1
+    # Dirichlet condition is about B(t) which is changed with FNN_fb, so don't need calculate here
     fb_dir_sampler_test = Sampler_IBC(np.array([0.]), np.array([T]),
                                 None, N_samples_testset_others, DTYPE=DTYPE, method='uniform' )
-    print('[fb_dir_sampler_test]')
-    print( f't: {fb_dir_sampler_test.x.shape}' )
+    print('[fb_dir_sampler]')
+    print( f'x: {fb_dir_sampler_test.x.shape}' )
     dataset_fb_dir_test = SamplerDataset(fb_dir_sampler_test, 'x')
     dataloader_fb_dir_test = DataLoader(dataset_fb_dir_test, batch_size=len(dataset_fb_dir_test), shuffle=False, pin_memory=True)
 
-    # Neumann  t: 1000*1 y: 1000
+    # Neumann  x: 2000*1
+    # Neumann condition is about B(t) which is changed with FNN_fb, so don't need calculate here
     fb_neu_sampler_test = Sampler_IBC(np.array([0.]), np.array([T]),
-                                h_2, N_samples_testset_others, DTYPE=DTYPE, method='uniform' )
-    print('[fb_neu_sampler_test]')
-    print( f't: {fb_neu_sampler_test.x.shape}     y: {fb_neu_sampler_test.y.shape}' )
-    dataset_fb_neu_test = SamplerDataset(fb_neu_sampler_test, 'x,y')
+                                None, N_samples_testset_others, DTYPE=DTYPE, method='uniform' )
+    print('[fb_neu_sampler]')
+    print( f'x: {fb_neu_sampler_test.x.shape}' )
+    dataset_fb_neu_test = SamplerDataset(fb_neu_sampler_test, 'x')
     dataloader_fb_neu_test = DataLoader(dataset_fb_neu_test, batch_size=len(dataset_fb_neu_test), shuffle=False, pin_memory=True)
 
     # Conditions passed to PINN
     sol_conditions_test = {'Interior': dataloader_intrr_test,
-                        'Initial':dataloader_init_test,
-                        'Dirichlet':dataloader_dir_test,
-                        'Neumann':None}
+                    'Initial':dataloader_init_test,
+                    'Dirichlet':dataloader_dir_test,
+                    'Neumann':None}
     fb_conditions_test = {'Initial':dataloader_fb_init_test,
-                        'Dirichlet':dataloader_fb_dir_test,
-                        'Neumann':dataloader_fb_neu_test}
-
+                    'Dirichlet':dataloader_fb_dir_test,
+                    'Neumann':dataloader_fb_neu_test}
+    
     return sol_conditions_test, fb_conditions_test
 
 

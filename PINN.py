@@ -2,23 +2,22 @@
 import os
 import time
 import random
+import argparse 
 import datetime
 import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 from itertools import cycle
 from scipy.stats import norm
+from functools import lru_cache
 
 import torch
 
 from config import OptionConfig
 from Utils import helper, plot
-from Sampler.dim1 import (
-    get_train_dataloaders, get_test_dataloaders
-)
-from Model.fnn import FNN
-from Model.pde import _pde
 
+from Model.fnn import FNN
+from Model.pde import pde_dim1, pde_dim2
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -30,12 +29,77 @@ print ("Training on:", DEVICE)
 ## ------------------------- ##
 config = OptionConfig()
 
+## parser arguments
+# python .\PINN.py --n_dim 1 --seed 10 --steps_sol 20
+parser = argparse.ArgumentParser(description='Deep Residual Method for American Basket Options')
+parser.add_argument('-n', '--n_dim', default=config.n_dim, type=int, metavar='DIMENSION', help='number of dimension')
+parser.add_argument('-sd', '--seed', default=config.seed, type=int, metavar='SEED', help='random seed')
+parser.add_argument('-ss', '--steps_sol', default=config.steps_fb_per_pde, type=int, metavar='STEPS OF SOL_MODEL', help='steps_fb_per_pde')
+args = parser.parse_args()
+
+# args.n_dim = 4
+# args.steps_sol = 10
+
+if args.n_dim == 1:
+    from Sampler.dim1 import (
+        get_train_dataloaders, get_test_dataloaders
+    )
+    from Model.train.run_dim1 import (
+        train_sol_model,
+        train_fb_model,
+        train_fb_sol_model,
+        test
+    )
+
+    n_dim = args.n_dim
+    alphas = None
+
+    # Define PDE
+    pde = lambda xs, ts, u_val, u_x: pde_dim1(xs, ts, u_val, u_x, config.r, config.sigma)
+
+elif args.n_dim > 1:
+    from Sampler.dim2 import (
+        get_train_dataloaders, get_test_dataloaders
+    )
+    from Model.train.run_dim2 import (
+        train_sol_model,
+        train_fb_model,
+        train_fb_sol_model,
+        test
+    )
+
+    config.N_samples_trainset_pde = 60000
+    config.N_samples_trainset_others = 1500
+    config.n_dim = args.n_dim
+    
+    if config.n_dim == 2:
+        config.sigma = [[0.05, 0.01], [0.01, 0.06]]
+    elif config.n_dim == 3:
+        config.sigma = [[0.05, 0.01, 0.1], [0.01, 0.06, -0.03], [0.1, -0.03, 0.4]]
+    elif config.n_dim == 4:
+        config.sigma = [[0.05, 0.01, 0.1, 0], [0.01, 0.06, -0.03, 0],
+                        [0.1, -0.03, 0.4, 0.2], [0, 0, 0.2, 0.3]]
+        config.N_samples_testset_pde = 120000
+        config.N_samples_testset_others = 1200
+    n_dim = config.n_dim
+    if isinstance(config.sigma, np.ndarray):
+        alphas = np.zeros((n_dim, n_dim))
+        for i in range(n_dim):
+            alphas[i, i] = np.sum( np.dot(config.sigma[i], config.sigma[i]) )
+            for j in range(i):
+                alphas[i, j] = alphas[j, i] = np.sum( np.dot(config.sigma[i], config.sigma[j]) )
+
+    # Define PDE
+    pde = lambda variables, u_val, derivatives: pde_dim2(variables, u_val, derivatives, 
+                                                        config.r, config.d, alphas)
+
 r = config.r
 T = config.T
 K = config.K
+d = config.d
 sigma = config.sigma
 
-seed = config.seed
+config.seed = args.seed
 def seed_torch(seed):
 	random.seed(seed)
 	os.environ['PYTHONHASHSEED'] = str(seed) # 为了禁止hash随机化，使得实验可复现
@@ -45,9 +109,11 @@ def seed_torch(seed):
 	torch.cuda.manual_seed_all(seed) # if you are using multi-GPU.
 	torch.backends.cudnn.benchmark = False
 	torch.backends.cudnn.deterministic = True
-seed_torch(seed)
+seed_torch(config.seed)
 
-image_1d_path = config.image_1d_path
+config.steps_fb_per_pde = args.steps_sol
+
+image_path = config.image_path
 checkpoint_path = config.checkpoint_path
 ##############################################################################################
 
@@ -58,14 +124,16 @@ checkpoint_path = config.checkpoint_path
 
 ## Trainset
 sol_conditions, fb_conditions = get_train_dataloaders(
-    lb=config.lb, ub=config.ub, K=K, T=T, DTYPE=config.DTYPE, batch_num=config.batch_num,
-    N_samples_trainset_pde=config.N_samples_trainset_pde,
+    n_dim=n_dim, r=r, K=K, T=T,
+    lb=config.lb, ub=config.ub, DTYPE=config.DTYPE, batch_num=config.batch_num,
+    N_samples_trainset_pde=config.N_samples_trainset_pde, 
     N_samples_trainset_others=config.N_samples_trainset_others,
 )
 
 ## Testset
 sol_conditions_test, fb_conditions_test = get_test_dataloaders(
-    lb=config.lb, ub=config.ub, K=K, T=T, DTYPE=config.DTYPE, 
+    n_dim=n_dim, r=r, K=K, T=T,
+    lb=config.lb, ub=config.ub, DTYPE=config.DTYPE, 
     N_samples_testset_pde=config.N_samples_testset_pde,
     N_samples_testset_others=config.N_samples_testset_others,
 )
@@ -73,381 +141,11 @@ sol_conditions_test, fb_conditions_test = get_test_dataloaders(
 
 
 ##############################################################################################
-## PINN Models
-# region ------------------- ##
-## ------------------------- ##
-# Define PDE
-pde = lambda xs, ts, u_val, u_x: _pde(xs, ts, u_val, u_x, r, sigma)
-
-def print_grad():
-    for name, param in sol_model.named_parameters():
-        if param.requires_grad:
-            print('='*40)
-            print(f'[sol_model]Accumulation for parameter {name}: {torch.sum(param)}')
-            break
-    for name, param in fb_model.named_parameters():
-        if param.requires_grad:
-            print(f'[fb_model ]Accumulation for parameter {name}: {torch.sum(param)}')
-            break
-
-def train_sol_model():
-
-    # set model to training mode
-    sol_model.train()
-
-    (Unsupervised_loss_batches, 
-    sol_init_loss_batches, sol_dir_loss_batches, sol_neu_loss_batches,
-    fb_init_loss_batches, fb_dir_loss_batches, fb_neu_loss_batches,
-    FB_loss_batches, Total_loss_batches) = [], [], [], [], [], [], [], [], []
-
-    for i, (data_sol_intrr, 
-            data_sol_init, data_sol_dir, #data_sol_neu,
-            data_fb_init, data_fb_dir, data_fb_neu) in enumerate(zip(sol_conditions['Interior'], 
-                                                                    cycle(sol_conditions['Initial']), 
-                                                                    cycle(sol_conditions['Dirichlet']),
-                                                                    # cycle(sol_conditions['Neumann']),
-                                                                    cycle(fb_conditions['Initial']), 
-                                                                    cycle(fb_conditions['Dirichlet']),
-                                                                    cycle(fb_conditions['Neumann']),
-                                                                    )):
-
-        x_sol_intrr, t_sol_intrr = data_sol_intrr
-        x_sol_intrr = x_sol_intrr.to(DEVICE)
-        t_sol_intrr = t_sol_intrr.to(DEVICE)
-        x_sol_intrr.requires_grad = True
-        t_sol_intrr.requires_grad = True
-        x_sol_init, y_sol_init = data_sol_init
-        x_sol_init = x_sol_init.to(DEVICE)
-        y_sol_init = y_sol_init.to(DEVICE)
-        x_sol_dir, y_sol_dir = data_sol_dir
-        x_sol_dir = x_sol_dir.to(DEVICE)
-        y_sol_dir = y_sol_dir.to(DEVICE)
-
-        x_fb_init, y_fb_init = data_fb_init
-        x_fb_init = x_fb_init.to(DEVICE)
-        y_fb_init = y_fb_init.to(DEVICE)
-        x_fb_dir = data_fb_dir
-        x_fb_dir = x_fb_dir.to(DEVICE)
-        x_fb_neu, y_fb_neu = data_fb_neu
-        x_fb_neu = x_fb_neu.to(DEVICE)
-        y_fb_neu = y_fb_neu.to(DEVICE)
-        x_fb_neu.requires_grad = True
-
-        # zero parameter gradients and then compute NN prediction of gradient
-        sol_model.zero_grad()
-        fb_model.zero_grad()
-        
-        #--------------- Compute Free Boundary losses
-        # Compute Initial Free Boundary Condition
-        fb_init_NN = fb_model(x_fb_init)
-        fb_init_loss = torch.mean((fb_init_NN - y_fb_init) ** 2)
-
-        # Compute Dirichlet Free Boundary Condition
-        s_values = fb_model(x_fb_dir)
-        fb_dir_NN = sol_model(torch.cat([s_values, x_fb_dir], dim=1))
-        fb_dir_target = torch.relu(torch.ones_like(s_values) * K - s_values)
-        fb_dir_loss = torch.mean((fb_dir_NN - fb_dir_target)**2)
-
-        # Compute Neumann Free Boundary Condition
-        s_values = fb_model(x_fb_neu)
-        fb_neu_NN = sol_model(torch.cat([s_values, x_fb_neu], dim=1))
-        fb_neu_NN_gradS = torch.autograd.grad(outputs=fb_neu_NN, inputs=s_values, grad_outputs=torch.ones_like(fb_neu_NN), create_graph=True)[0]
-        fb_neu_loss = torch.mean((fb_neu_NN_gradS - y_fb_neu)**2)
-
-        # Compute FB loss
-        FB_loss = config.fb_weight[0] * fb_init_loss + \
-                  config.fb_weight[1] * fb_dir_loss + \
-                  config.fb_weight[2] * fb_neu_loss
-
-        #--------------- Compute PINN losses
-        # Compute unsupervised loss
-        s_values = fb_model(torch.cat([t_sol_intrr], dim=-1))
-        x_sol_intrr_gt_Bt = x_sol_intrr[ x_sol_intrr > s_values ].view(-1,1)    # 大于B(t)的内点，S取值
-        t_sol_intrr_gt_Bt = t_sol_intrr[ x_sol_intrr > s_values ].view(-1,1)    # 大于B(t)的内点，t取值
-        sol_intrr_NN = sol_model(torch.cat([x_sol_intrr_gt_Bt, t_sol_intrr_gt_Bt], dim=1))
-        sol_intrr_NN_gradS = torch.autograd.grad(outputs=sol_intrr_NN, inputs=x_sol_intrr_gt_Bt, grad_outputs=torch.ones_like(sol_intrr_NN), create_graph=True)[0]
-        Unsupervised_loss = torch.mean((pde(x_sol_intrr_gt_Bt, t_sol_intrr_gt_Bt, sol_intrr_NN, sol_intrr_NN_gradS))**2)
-
-        # Compute Initial Condition
-        sol_init_NN = sol_model(x_sol_init)
-        if len(sol_init_NN.shape) > 1:
-            sol_init_loss = torch.mean((sol_init_NN - y_sol_init.unsqueeze(-1))**2)
-        else:
-            sol_init_loss = torch.mean((sol_init_NN - y_sol_init)**2)
-
-        # Compute Dirichlet Boundary Condition
-        sol_dir_NN = sol_model(x_sol_dir)
-        sol_dir_loss = torch.mean((sol_dir_NN - y_sol_dir)**2)
-
-        # Compute Neumann Boundary Condition
-        sol_neu_loss = 0
-
-        #--------------- Compute total loss
-        Total_loss = (config.pde_weight * Unsupervised_loss +
-                      config.sup_weight[0] * sol_init_loss +
-                      config.sup_weight[1] * sol_dir_loss +
-                      config.sup_weight[2] * sol_neu_loss +
-                      config.fb_weight[1] * fb_dir_loss +
-                      config.fb_weight[2] * fb_neu_loss )
-        
-        # print_grad()
-
-        # zero parameter gradients
-        sol_optimizer.zero_grad()
-        fb_optimizer.zero_grad()
-        # backpropagation
-        Total_loss.backward()
-        # parameter update    [ fb_model don't need update ]
-        sol_optimizer.step()
-
-        # integrate loss over the entire training datset
-        Unsupervised_loss_batches.append(Unsupervised_loss.item())
-        sol_init_loss_batches.append(sol_init_loss.item())
-        sol_dir_loss_batches.append(sol_dir_loss.item())
-        sol_neu_loss_batches.append(sol_neu_loss)
-        fb_init_loss_batches.append(fb_init_loss.item())
-        fb_dir_loss_batches.append(fb_dir_loss.item())
-        fb_neu_loss_batches.append(fb_neu_loss.item())
-        FB_loss_batches.append(FB_loss.item())
-        Total_loss_batches.append(Total_loss.item())
-
-    
-    return (np.mean(Unsupervised_loss_batches), 
-            np.mean(sol_init_loss_batches), np.mean(sol_dir_loss_batches), np.mean(sol_neu_loss_batches),
-            np.mean(fb_init_loss_batches), np.mean(fb_dir_loss_batches), np.mean(fb_neu_loss_batches),
-            np.mean(FB_loss_batches), np.mean(Total_loss_batches)
-            )
-
-def train_fb_model():
-
-    # set model to training mode
-    fb_model.train()
-
-    (fb_init_loss_batches, fb_dir_loss_batches, fb_neu_loss_batches,
-    FB_loss_batches) = [], [], [], []
-
-    for i, (data_sol_intrr, 
-            data_sol_init, data_sol_dir, #data_sol_neu,
-            data_fb_init, data_fb_dir, data_fb_neu) in enumerate(zip(sol_conditions['Interior'], 
-                                                                    cycle(sol_conditions['Initial']), 
-                                                                    cycle(sol_conditions['Dirichlet']),
-                                                                    # cycle(sol_conditions['Neumann']),
-                                                                    cycle(fb_conditions['Initial']), 
-                                                                    cycle(fb_conditions['Dirichlet']),
-                                                                    cycle(fb_conditions['Neumann']),
-                                                                    )):
-        
-        x_sol_intrr, t_sol_intrr = data_sol_intrr
-        x_sol_intrr = x_sol_intrr.to(DEVICE)
-        t_sol_intrr = t_sol_intrr.to(DEVICE)
-        x_sol_intrr.requires_grad = True
-        t_sol_intrr.requires_grad = True
-        x_sol_init, y_sol_init = data_sol_init
-        x_sol_init = x_sol_init.to(DEVICE)
-        y_sol_init = y_sol_init.to(DEVICE)
-        x_sol_dir, y_sol_dir = data_sol_dir
-        x_sol_dir = x_sol_dir.to(DEVICE)
-        y_sol_dir = y_sol_dir.to(DEVICE)
-
-        x_fb_init, y_fb_init = data_fb_init
-        x_fb_init = x_fb_init.to(DEVICE)
-        y_fb_init = y_fb_init.to(DEVICE)
-        x_fb_dir = data_fb_dir
-        x_fb_dir = x_fb_dir.to(DEVICE)
-        x_fb_neu, y_fb_neu = data_fb_neu
-        x_fb_neu = x_fb_neu.to(DEVICE)
-        y_fb_neu = y_fb_neu.to(DEVICE)
-        x_fb_neu.requires_grad = True
-
-        # zero parameter gradients and then compute NN prediction of gradient
-        sol_model.zero_grad()
-        fb_model.zero_grad()
-        
-        #--------------- Compute Free Boundary losses
-        # Compute Initial Free Boundary Condition
-        fb_init_NN = fb_model(x_fb_init)
-        fb_init_loss = torch.mean((fb_init_NN - y_fb_init) ** 2)
-
-        # Compute Dirichlet Free Boundary Condition
-        s_values = fb_model(x_fb_dir)
-        fb_dir_NN = sol_model(torch.cat([s_values, x_fb_dir], dim=1))
-        fb_dir_target = torch.relu(torch.ones_like(s_values) * K - s_values)
-        fb_dir_loss = torch.mean((fb_dir_NN - fb_dir_target)**2)
-
-        # Compute Neumann Free Boundary Condition
-        s_values = fb_model(x_fb_neu)
-        fb_neu_NN = sol_model(torch.cat([s_values, x_fb_neu], dim=1))
-        fb_neu_NN_gradS = torch.autograd.grad(outputs=fb_neu_NN, inputs=s_values, grad_outputs=torch.ones_like(fb_neu_NN), create_graph=True)[0]
-        fb_neu_loss = torch.mean((fb_neu_NN_gradS - y_fb_neu)**2)
-
-        # Compute FB loss
-        FB_loss = config.fb_weight[0] * fb_init_loss + \
-                  config.fb_weight[1] * fb_dir_loss + \
-                  config.fb_weight[2] * fb_neu_loss
-
-        # print_grad()
-
-        # zero parameter gradients
-        sol_optimizer.zero_grad()
-        fb_optimizer.zero_grad()
-        # backpropagation
-        FB_loss.backward()
-        # parameter update  [ sol_model don't need update ]
-        fb_optimizer.step()
-
-        # integrate loss over the entire training datset
-        fb_init_loss_batches.append(fb_init_loss.item())
-        fb_dir_loss_batches.append(fb_dir_loss.item())
-        fb_neu_loss_batches.append(fb_neu_loss.item())
-        FB_loss_batches.append(FB_loss.item())
-
-    
-    return np.mean(fb_init_loss_batches), np.mean(fb_dir_loss_batches), np.mean(fb_neu_loss_batches), np.mean(FB_loss_batches)
-
-def train_fb_sol_model():
-
-    # set model to training mode
-    sol_model.train()
-    fb_model.train()
-
-    (Unsupervised_loss_batches, 
-    sol_init_loss_batches, sol_dir_loss_batches, sol_neu_loss_batches,
-    fb_init_loss_batches, fb_dir_loss_batches, fb_neu_loss_batches,
-    FB_loss_batches, Total_loss_batches) = [], [], [], [], [], [], [], [], []
-
-    for i, (data_sol_intrr, 
-            data_sol_init, data_sol_dir, #data_sol_neu,
-            data_fb_init, data_fb_dir, data_fb_neu) in enumerate(zip(sol_conditions['Interior'], 
-                                                                    cycle(sol_conditions['Initial']), 
-                                                                    cycle(sol_conditions['Dirichlet']),
-                                                                    # cycle(sol_conditions['Neumann']),
-                                                                    cycle(fb_conditions['Initial']), 
-                                                                    cycle(fb_conditions['Dirichlet']),
-                                                                    cycle(fb_conditions['Neumann']),
-                                                                    )):
-
-        x_sol_intrr, t_sol_intrr = data_sol_intrr
-        x_sol_intrr = x_sol_intrr.to(DEVICE)
-        t_sol_intrr = t_sol_intrr.to(DEVICE)
-        x_sol_intrr.requires_grad = True
-        t_sol_intrr.requires_grad = True
-        x_sol_init, y_sol_init = data_sol_init
-        x_sol_init = x_sol_init.to(DEVICE)
-        y_sol_init = y_sol_init.to(DEVICE)
-        x_sol_dir, y_sol_dir = data_sol_dir
-        x_sol_dir = x_sol_dir.to(DEVICE)
-        y_sol_dir = y_sol_dir.to(DEVICE)
-
-        x_fb_init, y_fb_init = data_fb_init
-        x_fb_init = x_fb_init.to(DEVICE)
-        y_fb_init = y_fb_init.to(DEVICE)
-        x_fb_dir = data_fb_dir
-        x_fb_dir = x_fb_dir.to(DEVICE)
-        x_fb_neu, y_fb_neu = data_fb_neu
-        x_fb_neu = x_fb_neu.to(DEVICE)
-        y_fb_neu = y_fb_neu.to(DEVICE)
-        x_fb_neu.requires_grad = True
-
-        # zero parameter gradients and then compute NN prediction of gradient
-        sol_model.zero_grad()
-        fb_model.zero_grad()
-        
-        #--------------- Compute Free Boundary losses
-        # Compute Initial Free Boundary Condition
-        fb_init_NN = fb_model(x_fb_init)
-        fb_init_loss = torch.mean((fb_init_NN - y_fb_init) ** 2)
-
-        # Compute Dirichlet Free Boundary Condition
-        s_values = fb_model(x_fb_dir)
-        fb_dir_NN = sol_model(torch.cat([s_values, x_fb_dir], dim=1))
-        fb_dir_target = torch.relu(torch.ones_like(s_values) * K - s_values)
-        fb_dir_loss = torch.mean((fb_dir_NN - fb_dir_target)**2)
-
-        # Compute Neumann Free Boundary Condition
-        s_values = fb_model(x_fb_neu)
-        fb_neu_NN = sol_model(torch.cat([s_values, x_fb_neu], dim=1))
-        fb_neu_NN_gradS = torch.autograd.grad(outputs=fb_neu_NN, inputs=s_values, grad_outputs=torch.ones_like(fb_neu_NN), create_graph=True)[0]
-        fb_neu_loss = torch.mean((fb_neu_NN_gradS - y_fb_neu)**2)
-
-        # Compute FB loss
-        FB_loss = config.fb_weight[0] * fb_init_loss + \
-                  config.fb_weight[1] * fb_dir_loss + \
-                  config.fb_weight[2] * fb_neu_loss
-
-        # print('@'*50)
-        # print_grad()
-
-        # zero parameter gradients
-        sol_optimizer.zero_grad()
-        fb_optimizer.zero_grad()
-        # backpropagation
-        FB_loss.backward(retain_graph=True)
-        # parameter update
-
-        #--------------- Compute PINN losses
-        # Compute unsupervised loss
-        s_values = fb_model(torch.cat([t_sol_intrr], dim=-1))
-        x_sol_intrr_gt_Bt = x_sol_intrr[ x_sol_intrr > s_values ].view(-1,1)    # 大于B(t)的内点，S取值
-        t_sol_intrr_gt_Bt = t_sol_intrr[ x_sol_intrr > s_values ].view(-1,1)    # 大于B(t)的内点，t取值
-        sol_intrr_NN = sol_model(torch.cat([x_sol_intrr_gt_Bt, t_sol_intrr_gt_Bt], dim=1))
-        sol_intrr_NN_gradS = torch.autograd.grad(outputs=sol_intrr_NN, inputs=x_sol_intrr_gt_Bt, grad_outputs=torch.ones_like(sol_intrr_NN), create_graph=True)[0]
-        Unsupervised_loss = torch.mean((pde(x_sol_intrr_gt_Bt, t_sol_intrr_gt_Bt, sol_intrr_NN, sol_intrr_NN_gradS))**2)
-
-        # Compute Initial Condition
-        sol_init_NN = sol_model(x_sol_init)
-        if len(sol_init_NN.shape) > 1:
-            sol_init_loss = torch.mean((sol_init_NN - y_sol_init.unsqueeze(-1))**2)
-        else:
-            sol_init_loss = torch.mean((sol_init_NN - y_sol_init)**2)
-
-        # Compute Dirichlet Boundary Condition
-        sol_dir_NN = sol_model(x_sol_dir)
-        sol_dir_loss = torch.mean((sol_dir_NN - y_sol_dir)**2)
-
-        # Compute Neumann Boundary Condition
-        sol_neu_loss = 0
-
-        #--------------- Compute total loss
-        Total_loss = (config.pde_weight * Unsupervised_loss +
-                      config.sup_weight[0] * sol_init_loss +
-                      config.sup_weight[1] * sol_dir_loss +
-                      config.sup_weight[2] * sol_neu_loss +
-                      config.fb_weight[1] * fb_dir_loss +
-                      config.fb_weight[2] * fb_neu_loss )
-        
-        # print_grad()
-
-        # backpropagation
-        Total_loss.backward()
-        # parameter update
-        fb_optimizer.step()
-        sol_optimizer.step()
-
-        # integrate loss over the entire training datset
-        Unsupervised_loss_batches.append(Unsupervised_loss.item())
-        sol_init_loss_batches.append(sol_init_loss.item())
-        sol_dir_loss_batches.append(sol_dir_loss.item())
-        sol_neu_loss_batches.append(sol_neu_loss)
-        fb_init_loss_batches.append(fb_init_loss.item())
-        fb_dir_loss_batches.append(fb_dir_loss.item())
-        fb_neu_loss_batches.append(fb_neu_loss.item())
-        FB_loss_batches.append(FB_loss.item())
-        Total_loss_batches.append(Total_loss.item())
-
-    
-    return (np.mean(Unsupervised_loss_batches), 
-            np.mean(sol_init_loss_batches), np.mean(sol_dir_loss_batches), np.mean(sol_neu_loss_batches),
-            np.mean(fb_init_loss_batches), np.mean(fb_dir_loss_batches), np.mean(fb_neu_loss_batches),
-            np.mean(FB_loss_batches), np.mean(Total_loss_batches)
-            )
-# endregion
-##############################################################################################
-
-
-##############################################################################################
 ## Training Models
 # region ------------------- ##
 ## ------------------------- ##
+
+
 print('*', '-' * 45, '*')
 print('===> neural network training ...')
 
@@ -476,20 +174,29 @@ fb_model.Xavier_initi()
 print('FNN_Fb Architecture:', "\n", fb_model)
 print('Total number of trainable parameters = ', sum(p.numel() for p in fb_model.parameters() if p.requires_grad))
 
-# create optimizer and learning rate schedular
+# create optimizer 
 sol_optimizer = torch.optim.RMSprop(sol_model.parameters(), lr=config.sol_lr)
-sol_schedular = torch.optim.lr_scheduler.ExponentialLR(sol_optimizer, gamma=0.9)
 fb_optimizer = torch.optim.RMSprop(fb_model.parameters(), lr=config.fb_lr)
-fb_schedular = torch.optim.lr_scheduler.ExponentialLR(fb_optimizer, gamma=0.9)
+# sol_optimizer = torch.optim.Adam(sol_model.parameters(), lr=config.sol_lr, betas=(0.9, 0.999), eps=1e-08, amsgrad=False)
+# fb_optimizer = torch.optim.Adam(fb_model.parameters(), lr=config.fb_lr, betas=(0.9, 0.999), eps=1e-08, amsgrad=False)
+
+# create learning rate schedular
+sol_schedular = torch.optim.lr_scheduler.ExponentialLR(sol_optimizer, gamma=0.95)
+fb_schedular = torch.optim.lr_scheduler.ExponentialLR(fb_optimizer, gamma=0.95)
 
 # load model to device
 sol_model = sol_model.to(DEVICE)
 fb_model = fb_model.to(DEVICE)
 
 # create log file
-logger = helper.Logger(os.path.join(checkpoint_path, 'log.txt'), title='American-Option-PINN-1d')
-logger.set_names(['Epoch', 'Learning Rate', 'Unsupervised Loss', 'Supervised Loss', 'Free Boundary Loss', 'Total Loss', 
+logger_train = helper.Logger(os.path.join(checkpoint_path, 'log_train.txt'), title='American-Option-PINN-1d-Train')
+logger_train.set_names(['Epoch', 'Learning Rate', 'Unsupervised Loss', 'Supervised Loss', 'Free Boundary Loss', 'Total Loss', 
                   'sol_init_loss', 'sol_dir_loss', 'sol_neu_loss', 'fb_init_loss', 'fb_dir_loss', 'fb_neu_loss'])
+logger_test = helper.Logger(os.path.join(checkpoint_path, 'log_test.txt'), title='American-Option-PINN-1d-Test')
+logger_test.set_names(['Epoch', 'Learning Rate', 'Unsupervised Loss', 'Supervised Loss', 'Free Boundary Loss', 'Total Loss', 
+                  'sol_init_loss', 'sol_dir_loss', 'sol_neu_loss', 'fb_init_loss', 'fb_dir_loss', 'fb_neu_loss'])
+vis_logger = helper.VisdomLogger(env='main', env_path='/'.join([checkpoint_path, 'visdom']))
+vis_textlogger = vis_logger.record_texts('LOSSES RECORDS')
 ## ------------------------- ##
 # Unsupervised Loss  = interior_loss
 # Supervised Loss    = sol_init_loss + sol_dir_loss + sol_neu_loss
@@ -500,27 +207,43 @@ logger.set_names(['Epoch', 'Learning Rate', 'Unsupervised Loss', 'Supervised Los
 ## ------------------------- ##
 
 
-#Early warning initialization
-early_warning = {'Target': 1e10, 'n_steps': 0}
+# Early warning initialization
+early_warning = {'Target': 1e10, 'n_steps': 0, 'n_steps_updateLR': 0}
 
 # Training
-(u_losses,
-sol_init_losses, sol_dir_losses, sol_neu_losses,
-fb_init_losses, fb_dir_losses, fb_neu_losses,
-fb_losses, total_losses) = [], [], [], [], [], [], [], [], []
-
 since = time.time()
 for epoch in tqdm(range(config.epochs), desc='PINNs - Training'):
     
     # Case 1: more mdl steps for a single fb step
-    for _ in range(config.steps_fb_per_pde - 1):
-        train_sol_model()
+    # for _ in range(config.steps_fb_per_pde - 1):
+    sol_model, fb_model, sol_optimizer, fb_optimizer = train_sol_model(
+                                                        sol_model, fb_model,
+                                                        sol_optimizer, fb_optimizer,
+                                                        pde,
+                                                        sol_conditions, fb_conditions,
+                                                        config, DEVICE,
+                                                        K=K, n_dim=n_dim
+                                                    )
     
     # Case 2: more fb steps for a single mdl step
-    for _ in range(0, config.steps_fb_per_pde+1, -1):
-        train_fb_model()
+    # for _ in range(0, config.steps_fb_per_pde+1, -1):
+    sol_model, fb_model, sol_optimizer, fb_optimizer = train_fb_model(
+                                                        sol_model, fb_model,
+                                                        sol_optimizer, fb_optimizer,
+                                                        sol_conditions, fb_conditions,
+                                                        config, DEVICE,
+                                                        K=K, n_dim=n_dim
+                                                    )
 
-    u_loss, sol_i_l, sol_d_l, sol_n_l, fb_i_l, fb_d_l, fb_n_l, fb_l, total_l = train_fb_sol_model()
+    (sol_model, fb_model, sol_optimizer, fb_optimizer), \
+        (u_loss, sol_i_l, sol_d_l, sol_n_l, fb_i_l, fb_d_l, fb_n_l, fb_l, total_l) = train_fb_sol_model(
+                                                                                        sol_model, fb_model,
+                                                                                        sol_optimizer, fb_optimizer,
+                                                                                        pde,
+                                                                                        sol_conditions, fb_conditions,
+                                                                                        config, DEVICE,
+                                                                                        K=K, n_dim=n_dim, epoch=epoch
+                                                                                    )
 
     # save current and best models to checkpoint
     is_best = total_l < early_warning['Target']
@@ -541,61 +264,127 @@ for epoch in tqdm(range(config.epochs), desc='PINNs - Training'):
                             'fb_optimizer': fb_optimizer.state_dict(),
                            }, is_best, checkpoint=checkpoint_path)
     # save training process to log file
-    logger.append([epoch+1, sol_optimizer.param_groups[0]['lr'], 
+    logger_train.append([epoch+1, sol_optimizer.param_groups[0]['lr'], 
                    u_loss, sol_i_l + sol_d_l + sol_n_l, fb_l, total_l, 
                    sol_i_l, sol_d_l, sol_n_l, fb_i_l, fb_d_l, fb_n_l, 
                    ])
+    (u_loss_test, sol_i_l_test, sol_d_l_test, sol_n_l_test, fb_i_l_test, 
+                        fb_d_l_test, fb_n_l_test, fb_l_test, total_l_test) = test(
+                                                                                sol_model, fb_model,
+                                                                                sol_conditions_test, fb_conditions_test,
+                                                                                pde, 
+                                                                                config, DEVICE,
+                                                                                K=K, n_dim=n_dim
+                                                                            )
+    logger_test.append([epoch+1, sol_optimizer.param_groups[0]['lr'], 
+                   u_loss_test, sol_i_l_test + sol_d_l_test + sol_n_l_test, fb_l_test, total_l_test, 
+                   sol_i_l_test, sol_d_l_test, sol_n_l_test, fb_i_l_test, fb_d_l_test, fb_n_l_test, 
+                   ])
+    # save visdom
+    vis_logger.record_lines(
+        Y=[sol_optimizer.param_groups[0]['lr']], X=[epoch+1], 
+        legend=['Learning Rate'], 
+        panel_name='TRAIN LR', title='learning rate', append=True if epoch>10 else False)
+    vis_logger.record_lines(
+        Y=[np.log10(u_loss), np.log10(sol_i_l + sol_d_l + sol_n_l), np.log10(fb_l), np.log10(total_l)], 
+        X=[epoch+1], 
+        legend=['Unsupervised Loss', 'Supervised Loss', 'Free Boundary Loss', 'Total Loss'], 
+        panel_name='TRAIN LOSS', title='train loss (log10)', append=True if epoch>10 else False)
+    vis_logger.record_lines(
+        Y=[np.log10(u_loss_test), np.log10(sol_i_l_test + sol_d_l_test + sol_n_l_test), np.log10(fb_l_test), np.log10(total_l_test)], 
+        X=[epoch+1], 
+        legend=['Unsupervised Loss', 'Supervised Loss', 'Free Boundary Loss', 'Total Loss'], 
+        panel_name='TEST LOSS', title='test loss (log10)', append=True if epoch>10 else False)
+    vis_logger.record_lines(Y=[np.log10(u_loss)], X=[epoch+1], legend=['pde_loss'], 
+        panel_name='TRAIN pde_loss', title='pde_loss (log10)', append=True if epoch>10 else False)
+    vis_logger.record_lines(Y=[np.log10(sol_i_l)], X=[epoch+1], legend=['sol_i_l'], 
+        panel_name='TRAIN sol_i_l', title='sol_init_loss (log10)', append=True if epoch>10 else False)
+    vis_logger.record_lines(Y=[np.log10(sol_d_l)], X=[epoch+1], legend=['sol_d_l'], 
+        panel_name='TRAIN sol_d_l', title='sol_dir_loss (log10)', append=True if epoch>10 else False)
+    vis_logger.record_lines(Y=[np.log10(fb_i_l)], X=[epoch+1], legend=['fb_i_l'], 
+        panel_name='TRAIN fb_i_l', title='fb_init_loss (log10)', append=True if epoch>10 else False)
+    vis_logger.record_lines(Y=[np.log10(fb_d_l)], X=[epoch+1], legend=['fb_d_l'], 
+        panel_name='TRAIN fb_d_l', title='fb_dir_loss (log10)', append=True if epoch>10 else False)
+    vis_logger.record_lines(Y=[np.log10(fb_n_l)], X=[epoch+1], legend=['fb_n_l'], 
+        panel_name='TRAIN fb_n_l', title='fb_neu_loss (log10)', append=True if epoch>10 else False)
     
+
     # adjust learning rate according to predefined schedule
-    sol_schedular.step()
-    fb_schedular.step()
+    if epoch <= 50:
+        sol_schedular.step()
+        fb_schedular.step()
+    else:
+        if is_best:
+            early_warning['n_steps_updateLR'] = 0
+        else:
+            early_warning['n_steps_updateLR'] += 1
+            
+            if n_dim < 4:
+                if epoch <= 500:
+                    patience_updateLR = 15
+                elif 500 < epoch <= 1000:
+                    patience_updateLR = 25
+                else:
+                    patience_updateLR = 100
+            else:
+                if epoch <= 500:
+                    patience_updateLR = 50
+                elif 500 < epoch <= 1000:
+                    patience_updateLR = 100
+                else:
+                    patience_updateLR = 150
 
-    # record losses
-    u_losses.append(u_loss)
-    sol_init_losses.append(sol_i_l)
-    sol_dir_losses.append(sol_d_l)
-    sol_neu_losses.append(sol_n_l)
-    fb_init_losses.append(fb_i_l)
-    fb_dir_losses.append(fb_d_l)
-    fb_neu_losses.append(fb_n_l)
-    fb_losses.append(fb_l)
-    total_losses.append(total_l)
+            if early_warning['n_steps_updateLR'] >= patience_updateLR:
+                print(f'==> Updating LR in epoch:{epoch}')
+                early_warning['n_steps_updateLR'] = 0
+                for _ in range(min(int((patience_updateLR // 5) / 2) + 1, 5)):
+                    sol_schedular.step()
+                    fb_schedular.step()
 
-    # print results
-    print_base = "{:<10}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}"
-    if epoch == 0:
-        print(print_base.format(
-                '|Epoch', '|Learning Rate', '|Unsupervised Loss', '|Supervised Loss', '|Free Boundary Loss', '|Total Loss', 
-                '|sol_init_loss', '|sol_dir_loss', '|sol_neu_loss', '|fb_init_loss', '|fb_dir_loss', '|fb_neu_loss'))
-        print(print_base.format('='*10, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20))
-        print('\n')
-    if epoch % config.verbose == 0:
-        print(print_base.format(epoch+1,
-                                format(sol_optimizer.param_groups[0]['lr'], '.20f')[:10],
-                                format(u_loss, '.20f')[:10],
-                                format(sol_i_l + sol_d_l + sol_n_l, '.20f')[:10],
-                                format(fb_l, '.20f')[:10],
-                                format(total_l, '.20f')[:10],
-                                format(sol_i_l, '.20f')[:10],
-                                format(sol_d_l, '.20f')[:10],
-                                format(sol_n_l, '.20f')[:10],
-                                format(fb_i_l, '.20f')[:10],
-                                format(fb_d_l, '.20f')[:10],
-                                format(fb_n_l, '.20f')[:10],
-                                ))
-    
     # update early_warning
     early_warning['Target'] = min(total_l, early_warning['Target'])
     if is_best:
-        print('==> Saving best model ...')
+        vis_logger.record_texts('==> Saving best model ...', vis_textlogger, True)
         early_warning['n_steps'] = 0
     else:
         early_warning['n_steps'] += 1
         if early_warning['n_steps'] >= config.patience:
             break
 
-logger.close()
+    # print results
+    print_base = "{:<10}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}{:<20}"
+    if epoch == 0:
+        TITLE = print_base.format(
+                '|Epoch', '|Learning Rate', '|Unsupervised Loss', '|Supervised Loss', '|Free Boundary Loss', '|Total Loss', 
+                '|sol_init_loss', '|sol_dir_loss', '|sol_neu_loss', '|fb_init_loss', '|fb_dir_loss', '|fb_neu_loss')
+        SPLIT = print_base.format('='*10, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20, '='*20)
+        vis_logger.record_texts(TITLE, vis_textlogger, True)
+        vis_logger.record_texts(SPLIT, vis_textlogger, True)
+        print(TITLE)
+        print(SPLIT)
+
+    LOSS = print_base.format(epoch+1,
+                            format(sol_optimizer.param_groups[0]['lr'], '.20f')[:10],
+                            format(u_loss, '.20f')[:10],
+                            format(sol_i_l + sol_d_l + sol_n_l, '.20f')[:10],
+                            format(fb_l, '.20f')[:10],
+                            format(total_l, '.20f')[:10],
+                            format(sol_i_l, '.20f')[:10],
+                            format(sol_d_l, '.20f')[:10],
+                            format(sol_n_l, '.20f')[:10],
+                            format(fb_i_l, '.20f')[:10],
+                            format(fb_d_l, '.20f')[:10],
+                            format(fb_n_l, '.20f')[:10],
+                            )
+    if epoch % config.verbose == 0 or is_best:
+        print(LOSS)
+    vis_logger.record_texts(LOSS, vis_textlogger, True)
+
 time_elapsed = time.time() - since
+logger_train.close()
+logger_test.close()
+vis_logger.save()
+vis_logger.close()
 
 print('Done in {}'.format(str(datetime.timedelta(seconds=time_elapsed))), '!')
 print('*', '-' * 45, '*', "\n", "\n")
@@ -603,19 +392,33 @@ print('*', '-' * 45, '*', "\n", "\n")
 ##############################################################################################
 
 
+
 ##############################################################################################
 ## Save results
 ## ------------------------- ##
-plot.plot_loss(os.path.join(image_1d_path, f'LOSS_seed_{seed}.png'), 
-               u_losses, 
-               sol_init_losses, 
-               sol_dir_losses, 
-               sol_neu_losses, 
-               fb_losses, 
-               total_losses)
+
+# config.n_dim = 2
+# config.steps_fb_per_pde = 10
+# config.seed = 2
+# checkpoint_path = config.checkpoint_path
+# image_path = config.image_path
+
+df_loss_train = pd.read_csv(os.path.join(checkpoint_path, 'log_train.txt'), sep='\t')
+plot.plot_loss(os.path.join(image_path, f'LOSS_TRAIN.png'), 
+               df_loss_train['Unsupervised Loss'], 
+               df_loss_train['sol_init_loss'], 
+               df_loss_train['sol_dir_loss'], 
+               df_loss_train['sol_neu_loss'], 
+               df_loss_train['Free Boundary Loss'], 
+               df_loss_train['Total Loss'])
+df_loss_test = pd.read_csv(os.path.join(checkpoint_path, 'log_test.txt'), sep='\t')
+plot.plot_loss(os.path.join(image_path, f'LOSS_TEST.png'), 
+               df_loss_test['Unsupervised Loss'], 
+               df_loss_test['sol_init_loss'], 
+               df_loss_test['sol_dir_loss'], 
+               df_loss_test['sol_neu_loss'], 
+               df_loss_test['Free Boundary Loss'], 
+               df_loss_test['Total Loss'])
 ##############################################################################################
-
-
-
 
 

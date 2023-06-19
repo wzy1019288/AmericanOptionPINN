@@ -1,5 +1,7 @@
 .history/
 Checkpoints/
 Images/
+DEBUG/
+archive/
 
 *.pyc
